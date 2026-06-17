@@ -17,61 +17,28 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 import daemon
 
-# ==============================================================================
-# 1. Tree Structure Data Model Definition
-# ==============================================================================
-class PMS5003STData(BaseModel):
-    pm_10: int; pm_25: int; pm_100: int
-    pm_10a: int; pm_25a: int; pm_100a: int
-    pm_03cnt: int; pm_05cnt: int; pm_10cnt: int; pm_25cnt: int; pm_50cnt: int; pm_100cnt: int
-    form: float; temp: float; mol: float
-
-class ENS160Data(BaseModel):
-    tvoc: float; eco2: float; iaq: int;
-
-class BMP280Data(BaseModel):
-    temp: float; press: float
-
-class AHT20Data(BaseModel):
-    temp: float; mol: float
-
-class RS3231RTCData(BaseModel):
-    temp:float;
-
-class ESP32Data(BaseModel):
-    temp: float;
-
-class MultiSensorPayload(BaseModel):
-    pms5003st_data: PMS5003STData
-    ens160_data: ENS160Data
-    bmp280_data: BMP280Data
-    aht20_data: AHT20Data
-    ds3231_rtc_data: RS3231RTCData
-    esp32_data: ESP32Data
-    time_stamp: int
-    device_id: str
-
 # Global configuration dictionary
 CONFIG: Dict[str, Any] = {}
 
 # ==============================================================================
-# 2. Configuration and Arguments Parser with Short Form & Help Options
+# 1. Configuration and Arguments Parser with Short Form & Help Options
 # ==============================================================================
 def parse_arguments_and_config():
     # Enforce standard formatted help output using the native -h/--help mechanism
     parser = argparse.ArgumentParser(
-        description="ivclock data receiver service",
+        description="report data receiver service",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
     # Core Server Flags
-    parser.add_argument("-c", "--config", type=str, default="/etc/ivclock/ivclock.conf", help="Configuration file path")
+    parser.add_argument("-c", "--config", type=str, default="/etc/report_hub/report_hub.conf", help="Configuration file path")
     parser.add_argument("-P", "--protocol", type=str, choices=["http", "https"], help="Service network protocol")
     parser.add_argument("-H", "--host", type=str, help="Service network listen bind address")
     parser.add_argument("-p", "--port", type=int, help="Service network listen bind port")
     parser.add_argument("-d", "--daemon", action="store_true", default=argparse.SUPPRESS, help="Run in POSIX background daemon mode")
     parser.add_argument("-f", "--log-file", type=str, help="Log storage target absolute file path")
     parser.add_argument("-l", "--log-level", type=str, choices=["debug", "info", "warning", "error"], help="Logging filter severity index")
+    parser.add_argument("-s", "--service-dir", type=str, help="Service Modules")
     
     # PID File Flag with short form -m
     parser.add_argument("-m", "--pid-file", type=str, help="Path to save runtime process ID file (.pid)")
@@ -90,7 +57,8 @@ def parse_arguments_and_config():
 
     defaults = {
         "protocol": "http", "host": "0.0.0.0", "port": 8989, "daemon": False,
-        "log_file": "/var/log/ivclock/ivclock.log", "log_level": "info", "pid_file": "/var/run/ivclock_server.pid",
+        "log_file": "/var/log/report_hub/report_hub.log", "log_level": "info", "service_dir" : "/etc/report_hub/service.d"
+        "pid_file": "/var/run/report_hub.pid",
         "ssl_key": "", "ssl_cert": "","influx_url": "http://127.0.0.1:8086", "influx_token": "",
         "influx_org": "my_org"
     }
@@ -108,6 +76,7 @@ def parse_arguments_and_config():
             if "log_file" in cfg["server"]: config_file_values["log_file"] = cfg["server"].get("log_file")
             if "log_level" in cfg["server"]: config_file_values["log_level"] = cfg["server"].get("log_level")
             if "pid_file" in cfg["server"]: config_file_values["pid_file"] = cfg["server"].get("pid_file")
+            if "service_dir" in cfg["server"]: config_file_values["service_dir"] = cfg["server"].get("service_dir") 
             if "ssl_key" in cfg["server"]: config_file_values["ssl_key"] = cfg["server"].get("ssl_key")
             if "ssl_cert" in cfg["server"]: config_file_values["ssl_cert"] = cfg["server"].get("ssl_cert")
         if "influxdb" in cfg:
@@ -124,7 +93,7 @@ def parse_arguments_and_config():
             CONFIG[key] = defaults[key]
 
 # ==============================================================================
-# 3. Millisecond-level Logging & HUP Rotate System
+# 2. Millisecond-level Logging & HUP Rotate System
 # ==============================================================================
 file_handler: logging.FileHandler = None
 formatter: logging.Formatter = None
@@ -178,19 +147,20 @@ def register_signal_handler():
 
 
 # ==============================================================================
-# 4. Load Plugins
+# 3. Load Plugins
 # ==============================================================================
 PLUGIN_MODELS: Dict[str, Type[BaseModel]] = {}
 # 凭证字典格式: {"服务名": ("用户名", "密码")}
 PLUGIN_CREDENTIALS: Dict[str, Tuple[str, str]] = {}
-SERVICE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "service.d"))
 
 def load_all_plugins_and_keys():
     """Scan directory and load python modules + security keys into memory"""
     PLUGIN_MODELS.clear()
     PLUGIN_CREDENTIALS.clear()
+
+    SERVICE_DIR = CONFIG["service_dir"]
     
-    if not os.path.exists(SERVICE_DIR):
+    if not os.path.exists():
         logger.error(f"Plugin directory not found: {SERVICE_DIR}")
         return
 
@@ -241,7 +211,7 @@ async def lifespan(app: FastAPI):
     app.state.influx_client.close()
                 
 # ==============================================================================
-# 5. FastAPI Web Service Core Application with HTTP Basic Auth Protection
+# 4. FastAPI Web Service Core Application with HTTP Basic Auth Protection
 # ==============================================================================
 app = FastAPI(lifespan=lifespan)
 security = HTTPBasic()
