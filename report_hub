@@ -1,0 +1,25 @@
+/var/log/report_hub/report_hub.log {
+    # Rotate log files everyday
+    daily
+    # If log file is missing, go to next one without throwing error
+    missingok
+    # Keep 7 days worth of backlogged history logs
+    rotate 7
+    # Compress rotated log files via gzip
+    compress
+    # Postpone compression until the next rotation cycle to ensure file handles are released
+    delaycompress
+    # Do not rotate the log if it is completely empty
+    notifempty
+    # Secure file creation attributes for primary log target
+    create 0640 root root
+    # Run postrotate script only once after all logs are rotated
+    sharedscripts
+    postrotate
+        # Send SIGHUP signal to python process to trigger filename handle re-opening
+        if [ -f /var/run/report_hub.pid ]; then \
+            kill -HUP $(cat /var/run/report_hub.pid) 2>/dev/null || true; \
+        fi
+    endscript
+}
+

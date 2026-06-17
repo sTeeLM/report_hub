@@ -1,0 +1,25 @@
+[Unit]
+Description=General Report Data Receiver Service
+After=network.target influxdb.service
+Documentation=https://www.madcat.cc
+
+[Service]
+Type=simple
+# Execution command pointing to your merged python script and strict config path
+ExecStart=/opt/site/server/usr/sbin/report_hub.py -c /etc/report_hub/report_hub.conf -d
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+PIDFile=/var/run/report_hub.pid
+# Automatically restart the pipeline if it crashes unexpectedly
+Restart=always
+RestartSec=5
+RuntimeDirectory=ivclock_server
+RuntimeDirectoryMode=0755
+# Run as root to ensure permission for raw logs and socket binding
+User=root
+# Resource limits setup
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
