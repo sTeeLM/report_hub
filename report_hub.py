@@ -10,10 +10,14 @@ import logging
 import pidfile
 import signal
 import secrets
-from typing import Dict, Any
+import importlib
+from contextlib import asynccontextmanager
+from typing import Dict, Any, Type, Tuple
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi import FastAPI, Query, HTTPException, Request, Depends, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from influxdb_client import InfluxDBClient
+from influxdb_client.client.write_api import SYNCHRONOUS
 import uvicorn
 import daemon
 
@@ -39,7 +43,7 @@ def parse_arguments_and_config():
     parser.add_argument("-f", "--log-file", type=str, help="Log storage target absolute file path")
     parser.add_argument("-l", "--log-level", type=str, choices=["debug", "info", "warning", "error"], help="Logging filter severity index")
     parser.add_argument("-s", "--service-dir", type=str, help="Service Modules")
-    
+
     # PID File Flag with short form -m
     parser.add_argument("-m", "--pid-file", type=str, help="Path to save runtime process ID file (.pid)")
 
@@ -57,7 +61,7 @@ def parse_arguments_and_config():
 
     defaults = {
         "protocol": "http", "host": "0.0.0.0", "port": 8989, "daemon": False,
-        "log_file": "/var/log/report_hub/report_hub.log", "log_level": "info", "service_dir" : "/etc/report_hub/service.d"
+        "log_file": "/var/log/report_hub/report_hub.log", "log_level": "info", "service_dir" : "/etc/report_hub/service.d",
         "pid_file": "/var/run/report_hub.pid",
         "ssl_key": "", "ssl_cert": "","influx_url": "http://127.0.0.1:8086", "influx_token": "",
         "influx_org": "my_org"
@@ -76,7 +80,7 @@ def parse_arguments_and_config():
             if "log_file" in cfg["server"]: config_file_values["log_file"] = cfg["server"].get("log_file")
             if "log_level" in cfg["server"]: config_file_values["log_level"] = cfg["server"].get("log_level")
             if "pid_file" in cfg["server"]: config_file_values["pid_file"] = cfg["server"].get("pid_file")
-            if "service_dir" in cfg["server"]: config_file_values["service_dir"] = cfg["server"].get("service_dir") 
+            if "service_dir" in cfg["server"]: config_file_values["service_dir"] = cfg["server"].get("service_dir")
             if "ssl_key" in cfg["server"]: config_file_values["ssl_key"] = cfg["server"].get("ssl_key")
             if "ssl_cert" in cfg["server"]: config_file_values["ssl_cert"] = cfg["server"].get("ssl_cert")
         if "influxdb" in cfg:
@@ -159,9 +163,9 @@ def load_all_plugins_and_keys():
     PLUGIN_CREDENTIALS.clear()
 
     SERVICE_DIR = CONFIG["service_dir"]
-    
-    if not os.path.exists():
-        logger.error(f"Plugin directory not found: {SERVICE_DIR}")
+
+    if not os.path.exists(SERVICE_DIR):
+        logging.error(f"Plugin directory not found: {SERVICE_DIR}")
         return
 
     for file_name in os.listdir(SERVICE_DIR):
@@ -169,22 +173,24 @@ def load_all_plugins_and_keys():
             service_name = file_name[:-3]
             script_path = os.path.join(SERVICE_DIR, file_name)
             key_path = os.path.join(SERVICE_DIR, f"{service_name}.key")
-            
-            # A. Dynamic execution and loading of the Pydantic Model
+
+            # A. Dynamic Import via importlib (Safe & robust way)
             try:
-                with open(script_path, "r", encoding="utf-8") as f:
-                    script_code = f.read()
-                local_scope = {}
-                exec(script_code, {}, local_scope)
-                if "MODULE_MODEL" in local_scope:
-                    PLUGIN_MODELS[service_name] = local_scope["MODULE_MODEL"]
+                spec = importlib.util.spec_from_file_location(service_name, script_path)
+                if spec is None or spec.loader is None:
+                    logging.error(f"Could not load spec for {file_name}")
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                if hasattr(module, "MODULE_MODEL"):
+                    PLUGIN_MODELS[service_name] = getattr(module, "MODULE_MODEL")
                 else:
-                    logger.warning(f"[SKIP] Plugin {file_name} missing MODULE_MODEL definition")
+                    logging.warning(f"[SKIP] Plugin {file_name} missing MODULE_MODEL definition")
                     continue
             except Exception as e:
-                logger.error(f"Failed to compile script {file_name}: {str(e)}")
+                logging.error(f"[ERROR] Failed to import script {file_name}: {str(e)}")
                 continue
-
             # B. Read corresponding .key file into the security mapping dictionary
             if os.path.exists(key_path):
                 try:
@@ -192,12 +198,12 @@ def load_all_plugins_and_keys():
                         content = f.read().strip()
                         correct_username, correct_password = content.split(":", 1)
                         PLUGIN_CREDENTIALS[service_name] = (correct_username, correct_password)
-                        logger.info(f"Successfully loaded plugin and credentials -> [{service_name}]")
+                        logging.info(f"Successfully loaded plugin and credentials -> [{service_name}]")
                 except Exception:
-                    logger.warning(f"Invalid credentials format in: {service_name}.key")
+                    logging.warning(f"Invalid credentials format in: {service_name}.key")
                     PLUGIN_CREDENTIALS[service_name] = None
             else:
-                logger.warning(f"Plugin [{service_name}] is missing an associated .key file")
+                logging.warning(f"Plugin [{service_name}] is missing an associated .key file")
                 PLUGIN_CREDENTIALS[service_name] = None
 
 @asynccontextmanager
@@ -209,7 +215,7 @@ async def lifespan(app: FastAPI):
     yield
     # Safely release resource pools when process shuts down
     app.state.influx_client.close()
-                
+
 # ==============================================================================
 # 4. FastAPI Web Service Core Application with HTTP Basic Auth Protection
 # ==============================================================================
@@ -219,14 +225,14 @@ security = HTTPBasic()
 def verify_plugin_credentials(service: str, credentials: HTTPBasicCredentials):
     """Perform O(1) secure validation purely out of RAM allocation map"""
     correct_creds = PLUGIN_CREDENTIALS.get(service)
-    
+
     if not correct_creds:
         logging.warning(f"None credential file for {service}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Unauthorized access or invalid service name: {service}"
         )
-        
+
     correct_username, correct_password = correct_creds
     logging.info(f"Checking credential for {correct_username}")
 
@@ -245,6 +251,12 @@ def verify_plugin_credentials(service: str, credentials: HTTPBasicCredentials):
 async def receive_sensor_data(payload: Dict[str, Any], request: Request, service: str = Query(..., description="The targeting service router identifier"), credentials: HTTPBasicCredentials = Depends(security)):
     raw_body = await request.body()
 
+    if not service:
+        logging.error("No service send")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No service send")
+
+    logging.info(f"Get payload from service {service}: {payload}")
+
     # 1. Memory-isolated verification check
     verify_plugin_credentials(service, credentials)
 
@@ -252,31 +264,31 @@ async def receive_sensor_data(payload: Dict[str, Any], request: Request, service
     model_cls = PLUGIN_MODELS.get(service)
     if not model_cls:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Active schema engine not mapped for service: {service}"
         )
-        
+
     try:
         # 3. Structural assertion and compilation payload conversion
         validated_data = model_cls.model_validate(payload)
         point_object = validated_data.to_influx_point()
-        
+
         # 4. Stream transaction execution into InfluxDB Time Series cluster
         app.state.write_api.write(bucket=service, org=CONFIG["influx_org"], record=point_object)
 
         logging.info("Successfully parsed and committed payload to InfluxDB.")
-        
+
         return {"status": "success", "service": service}
-        
+
     except Exception as e:
-        logging.error(f"Failed to process payload or write to InfluxDB: {str(e)}") 
+        logging.error(f"Failed to process payload or write to InfluxDB: {str(e)}")
         if "ValidationError" in type(e).__name__:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal pipeline failure processing metrics: {str(e)}"
         )
-    
+
 def run_web_server():
     # 💡 Core Dynamic Logic: Inject SSL context attributes when protocol is explicitly set to https
     if CONFIG["protocol"].lower() == "https" and CONFIG["ssl_key"] and CONFIG["ssl_cert"]:
@@ -312,7 +324,7 @@ if __name__ == "__main__":
 
     if CONFIG["daemon"]:
         logging.info(f"Switching service to background Daemon mode. Log: {CONFIG['log_file']}")
-        
+
         # Ensure the parent directory for the PID file exists before locking context
         pid_file_path = CONFIG["pid_file"]
         pid_dir = os.path.dirname(pid_file_path)
