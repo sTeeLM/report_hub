@@ -146,8 +146,12 @@ def handle_hup_signal(signum, frame):
         logger.addHandler(file_handler)
         logger.info("Log file has been successfully re-opened.")
 
+def handle_term_signal(signum, frame):
+    logger.info("Recevice TERM, quit...") 
+        
 def register_signal_handler():
     signal.signal(signal.SIGHUP, handle_hup_signal)
+    signal.signal(signal.SIGTERM, handle_term_signal)
 
 
 # ==============================================================================
@@ -191,6 +195,7 @@ def load_all_plugins_and_keys():
             except Exception as e:
                 logging.error(f"[ERROR] Failed to import script {file_name}: {str(e)}")
                 continue
+            
             # B. Read corresponding .key file into the security mapping dictionary
             if os.path.exists(key_path):
                 try:
@@ -214,6 +219,7 @@ async def lifespan(app: FastAPI):
     app.state.write_api = app.state.influx_client.write_api(write_options=SYNCHRONOUS)
     yield
     # Safely release resource pools when process shuts down
+    logging.info("Closing influx client...")
     app.state.influx_client.close()
 
 # ==============================================================================
@@ -227,10 +233,11 @@ def verify_plugin_credentials(service: str, credentials: HTTPBasicCredentials):
     correct_creds = PLUGIN_CREDENTIALS.get(service)
 
     if not correct_creds:
-        logging.warning(f"None credential file for {service}")
+        logging.warning(f"None credential record for {service}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Unauthorized access or invalid service name: {service}"
+            detail=f"Unauthorized access or invalid service name: {service}",
+            headers={"WWW-Authenticate": "Basic"}
         )
 
     correct_username, correct_password = correct_creds
@@ -255,7 +262,7 @@ async def receive_sensor_data(payload: Dict[str, Any], request: Request, service
         logging.error("No service send")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No service send")
 
-    logging.info(f"Get payload from service {service}: {payload}")
+    logging.info(f"Get payload from service {service} report: {payload}")
 
     # 1. Memory-isolated verification check
     verify_plugin_credentials(service, credentials)
@@ -312,6 +319,8 @@ def run_web_server():
 if __name__ == "__main__":
     parse_arguments_and_config()
     setup_logging()
+    
+    logging.info("Up report service") 
 
     log_config = CONFIG.copy()
     if log_config.get("influx_token"):
