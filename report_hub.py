@@ -146,12 +146,8 @@ def handle_hup_signal(signum, frame):
         logger.addHandler(file_handler)
         logger.info("Log file has been successfully re-opened.")
 
-def handle_term_signal(signum, frame):
-    logger.info("Recevice TERM, quit...") 
-        
 def register_signal_handler():
     signal.signal(signal.SIGHUP, handle_hup_signal)
-    signal.signal(signal.SIGTERM, handle_term_signal)
 
 
 # ==============================================================================
@@ -195,7 +191,7 @@ def load_all_plugins_and_keys():
             except Exception as e:
                 logging.error(f"[ERROR] Failed to import script {file_name}: {str(e)}")
                 continue
-            
+
             # B. Read corresponding .key file into the security mapping dictionary
             if os.path.exists(key_path):
                 try:
@@ -319,8 +315,8 @@ def run_web_server():
 if __name__ == "__main__":
     parse_arguments_and_config()
     setup_logging()
-    
-    logging.info("Up report service") 
+
+    logging.info("Up report service")
 
     log_config = CONFIG.copy()
     if log_config.get("influx_token"):
